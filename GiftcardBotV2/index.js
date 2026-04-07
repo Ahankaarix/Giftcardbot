@@ -1,5 +1,12 @@
 require('dotenv').config();
 
+// Strip accidental "KEY=value" prefix if user copy-pasted entire env line as secret value
+function getEnv(key, fallback = '') {
+  const raw = process.env[key] || fallback;
+  const prefix = key + '=';
+  return raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
+}
+
 const {
   Client,
   GatewayIntentBits,
@@ -28,12 +35,12 @@ const Razorpay = require('razorpay');
 // ========================================
 
 const CONFIG = {
-  BOT_TOKEN: process.env.BOT_TOKEN || '',
+  BOT_TOKEN: getEnv('BOT_TOKEN'),
   DB: {
-    host: process.env.DB_HOST || '104.234.180.242',
-    user: process.env.DB_USER || 'u82822_PZ9oYvFPp2',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 's82822_vipshop',
+    host: getEnv('DB_HOST', '104.234.180.242'),
+    user: getEnv('DB_USER', 'u82822_PZ9oYvFPp2'),
+    password: getEnv('DB_PASSWORD'),
+    database: getEnv('DB_NAME', 's82822_vipshop'),
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
@@ -251,7 +258,14 @@ async function initDatabase() {
     await conn.query(`
       ALTER TABLE transactions
         ADD COLUMN IF NOT EXISTS paid_amount INT DEFAULT NULL,
-        ADD COLUMN IF NOT EXISTS payment_app VARCHAR(100) DEFAULT NULL
+        ADD COLUMN IF NOT EXISTS payment_app VARCHAR(100) DEFAULT NULL,
+        ADD COLUMN IF NOT EXISTS admin_msg_id VARCHAR(255) DEFAULT NULL
+    `).catch(() => {});
+
+    // Add 'expired' status to the enum if not already present
+    await conn.query(`
+      ALTER TABLE transactions
+        MODIFY COLUMN status ENUM('pending','approved','rejected','captured','expired') DEFAULT 'pending'
     `).catch(() => {});
 
     await conn.query(`
@@ -1084,6 +1098,8 @@ client.once('clientReady', async () => {
     const stats = await runAutoDbSync('scheduled', 'system');
     if (stats) await postDbReport(client, stats, 'scheduled');
   }, 30 * 60 * 1000);
+
+  startExpiryChecker(client);
 });
 
 client.on('shardReconnecting', () => console.log('[BOT] Reconnecting...'));
@@ -1495,7 +1511,68 @@ client.on('interactionCreate', async (interaction) => {
       );
       const txnId = result.insertId;
 
-      // Reply to user first, then send admin notification — both are now guaranteed to run
+      // Build admin notification payload
+      const offerInfo = offer ? `\n> 🏷️ **${offer.pct}% Offer Applied** — Face Value ₹${amount}, Paid ₹${payPrice}` : '';
+      const adminEmbed = new EmbedBuilder()
+        .setTitle('📋 Manual Payment — Review Required')
+        .setDescription(`New payment submission needs approval.${offerInfo}`)
+        .addFields(
+          { name: '👤 Discord User', value: `<@${interaction.user.id}> (${interaction.user.tag})`, inline: false },
+          { name: '🎁 Gift Card', value: `₹${amount}`, inline: true },
+          { name: '💸 Amount Paid', value: `₹${payPrice}`, inline: true },
+          { name: '🆔 Ref', value: `#${txnId}`, inline: true },
+          { name: '📝 UPI Txn ID', value: `\`${upiTxn}\``, inline: true },
+          { name: '👤 Sender Name', value: sender, inline: true },
+          { name: '📱 Payment App', value: payApp, inline: true }
+        )
+        .setColor(0xFFA500).setTimestamp()
+        .setFooter({ text: `Transaction #${txnId} • Submitted by ${interaction.user.tag}` });
+
+      if (gatewayTxn) adminEmbed.addFields({ name: '🔗 Gateway / Ref ID', value: `\`${gatewayTxn}\``, inline: false });
+
+      const adminComponents = [new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`approve_${txnId}_${interaction.user.id}_${amount}`)
+          .setLabel('✅ Approve & Deliver')
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`reject_${txnId}_${interaction.user.id}`)
+          .setLabel('❌ Reject')
+          .setStyle(ButtonStyle.Danger)
+      )];
+
+      // Try to send admin notification — with one automatic retry after 3 seconds.
+      // If BOTH attempts fail, roll back the transaction so the user is NOT stuck.
+      let adminNotified = false;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const ch = await client.channels.fetch(CONFIG.STATUS_CHANNEL_ID);
+          const adminMsg = await ch.send({ embeds: [adminEmbed], components: adminComponents });
+          await pool.query('UPDATE transactions SET admin_msg_id = ? WHERE id = ?', [adminMsg.id, txnId]).catch(() => {});
+          adminNotified = true;
+          break;
+        } catch (err) {
+          console.error(`[ADMIN NOTIFY] Attempt ${attempt} failed:`, err.message);
+          if (attempt === 1) await new Promise(r => setTimeout(r, 3000)); // wait 3s then retry
+        }
+      }
+
+      if (!adminNotified) {
+        // Admin panel could not be delivered — roll back so user is not stuck
+        await pool.query('DELETE FROM transactions WHERE id = ?', [txnId]).catch(() => {});
+        return interaction.editReply({
+          embeds: [new EmbedBuilder()
+            .setTitle('⚠️ Submission Failed — Please Retry')
+            .setDescription(
+              'We could not deliver your payment request to the admin panel due to a temporary error.\n\n' +
+              '**Your payment has NOT been recorded** — you are free to try submitting again.\n' +
+              'If this keeps happening, please contact support.'
+            )
+            .setColor(0xFF4500).setTimestamp()]
+        });
+      }
+
+      // Admin was notified — confirm to user
       await interaction.editReply({
         embeds: [new EmbedBuilder()
           .setTitle('✅ Payment Submitted for Review')
@@ -1504,47 +1581,12 @@ client.on('interactionCreate', async (interaction) => {
             { name: '🆔 Reference', value: `#${txnId}`, inline: true },
             { name: '🎁 Gift Card', value: `₹${amount}`, inline: true },
             { name: '💸 Amount Paid', value: `₹${payPrice}${offer ? ` (${offer.pct}% OFF)` : ''}`, inline: true },
-            { name: '📱 UPI Txn ID', value: `\`${upiTxn}\``, inline: false }
+            { name: '📱 UPI Txn ID', value: `\`${upiTxn}\``, inline: false },
+            { name: '⏰ Approval Window', value: 'Admins have **12 hours** to approve or reject.\nIf no action is taken, your request will be automatically cancelled and you will be notified via DM.', inline: false }
           )
           .setColor(0x00FF00).setTimestamp()
           .setFooter({ text: 'Please keep your UPI transaction ID safe' })]
       });
-
-      // Admin notification
-      try {
-        const ch = await client.channels.fetch(CONFIG.STATUS_CHANNEL_ID);
-        const offerInfo = offer ? `\n> 🏷️ **${offer.pct}% Offer Applied** — Face Value ₹${amount}, Paid ₹${payPrice}` : '';
-        const adminEmbed = new EmbedBuilder()
-          .setTitle('📋 Manual Payment — Review Required')
-          .setDescription(`New payment submission needs approval.${offerInfo}`)
-          .addFields(
-            { name: '👤 Discord User', value: `<@${interaction.user.id}> (${interaction.user.tag})`, inline: false },
-            { name: '🎁 Gift Card', value: `₹${amount}`, inline: true },
-            { name: '💸 Amount Paid', value: `₹${payPrice}`, inline: true },
-            { name: '🆔 Ref', value: `#${txnId}`, inline: true },
-            { name: '📝 UPI Txn ID', value: `\`${upiTxn}\``, inline: true },
-            { name: '👤 Sender Name', value: sender, inline: true },
-            { name: '📱 Payment App', value: payApp, inline: true }
-          )
-          .setColor(0xFFA500).setTimestamp()
-          .setFooter({ text: `Transaction #${txnId} • Submitted by ${interaction.user.tag}` });
-
-        if (gatewayTxn) adminEmbed.addFields({ name: '🔗 Gateway / Ref ID', value: `\`${gatewayTxn}\``, inline: false });
-
-        await ch.send({
-          embeds: [adminEmbed],
-          components: [new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setCustomId(`approve_${txnId}_${interaction.user.id}_${amount}`)
-              .setLabel('✅ Approve & Deliver')
-              .setStyle(ButtonStyle.Success),
-            new ButtonBuilder()
-              .setCustomId(`reject_${txnId}_${interaction.user.id}`)
-              .setLabel('❌ Reject')
-              .setStyle(ButtonStyle.Danger)
-          )]
-        });
-      } catch (err) { console.error('[ADMIN NOTIFY]', err.message); }
 
       await logAction('MANUAL_SUBMITTED', interaction.user.id, `UPI: ${upiTxn}, ₹${amount} (paid ₹${payPrice})`);
       await sendTransactionLog(client, {
@@ -1798,6 +1840,100 @@ app.post('/webhook/cashfree', async (req, res) => {
 app.listen(CONFIG.WEBHOOK_PORT, '0.0.0.0', () =>
   console.log(`[SERVER] Webhook server running on port ${CONFIG.WEBHOOK_PORT}`)
 );
+
+// ========================================
+// 12-HOUR EXPIRY CHECKER
+// ========================================
+
+const EXPIRY_HOURS = 12;
+const EXPIRY_CHECK_INTERVAL = 10 * 60 * 1000; // check every 10 minutes
+
+async function checkAndExpireTransactions(discordClient) {
+  if (!pool) return;
+  try {
+    // Expire if:
+    //   (a) pending for > 12 hours (normal expiry — admin saw it but took no action), OR
+    //   (b) pending for > 1 hour AND admin_msg_id IS NULL (admin panel was never delivered)
+    const [expired] = await pool.query(`
+      SELECT id, user_id, amount, paid_amount, upi_txn, admin_msg_id
+      FROM transactions
+      WHERE status = 'pending'
+        AND (
+          created_at <= NOW() - INTERVAL ${EXPIRY_HOURS} HOUR
+          OR (admin_msg_id IS NULL AND created_at <= NOW() - INTERVAL 1 HOUR)
+        )
+    `);
+
+    for (const txn of expired) {
+      try {
+        // Mark as expired in DB
+        await pool.query("UPDATE transactions SET status = 'expired' WHERE id = ?", [txn.id]);
+
+        // DM the user — notify them to resubmit
+        const noPanelDelivered = !txn.admin_msg_id;
+        try {
+          const user = await discordClient.users.fetch(txn.user_id);
+          await user.send({
+            embeds: [new EmbedBuilder()
+              .setTitle('⏰ Payment Request Expired')
+              .setDescription(
+                noPanelDelivered
+                  ? `Your payment submission (Ref **#${txn.id}**) for a ₹${txn.amount} gift card could **not be delivered to the admin panel** and has been automatically cancelled.\n\n` +
+                    `**Your pending status has been cleared** — you can submit again right now.\n\n` +
+                    `We apologize for the inconvenience! Please try resubmitting in the store channel.`
+                  : `Your payment submission (Ref **#${txn.id}**) for a ₹${txn.amount} gift card has **expired** after ${EXPIRY_HOURS} hours without admin action.\n\n` +
+                    `**What to do next:**\n` +
+                    `• If you already paid, please resubmit your transaction details in the store channel.\n` +
+                    `• If you have not paid yet, simply make a new purchase when ready.\n\n` +
+                    `We apologize for the inconvenience!`
+              )
+              .addFields(
+                { name: '🆔 Reference', value: `#${txn.id}`, inline: true },
+                { name: '🎁 Gift Card', value: `₹${txn.amount}`, inline: true },
+                { name: '📱 UPI Txn ID', value: txn.upi_txn ? `\`${txn.upi_txn}\`` : '—', inline: true }
+              )
+              .setColor(0xFF8C00)
+              .setTimestamp()
+              .setFooter({ text: 'You can resubmit at any time from the store channel.' })]
+          });
+        } catch (_) {}
+
+        // Update the admin panel message — remove buttons, mark as expired
+        try {
+          const adminCh = await discordClient.channels.fetch(CONFIG.STATUS_CHANNEL_ID);
+          if (txn.admin_msg_id) {
+            const adminMsg = await adminCh.messages.fetch(txn.admin_msg_id).catch(() => null);
+            if (adminMsg) {
+              const expiredEmbed = EmbedBuilder.from(adminMsg.embeds[0])
+                .setColor(0x888888)
+                .setTitle('⏰ Payment Request Expired (No Action Taken)')
+                .setFooter({ text: `Auto-expired after ${EXPIRY_HOURS}h — ${new Date().toLocaleString('en-IN')}` });
+              await adminMsg.edit({ embeds: [expiredEmbed], components: [] });
+            }
+          }
+        } catch (_) {}
+
+        await logAction('EXPIRED', txn.user_id, `Txn #${txn.id}, ₹${txn.amount}, UPI: ${txn.upi_txn}`);
+        console.log(`[EXPIRY] Transaction #${txn.id} expired after ${EXPIRY_HOURS}h`);
+      } catch (err) {
+        console.error(`[EXPIRY] Error handling txn #${txn.id}:`, err.message);
+      }
+    }
+
+    if (expired.length > 0) {
+      await postOrUpdateDashboard(discordClient, true).catch(() => {});
+    }
+  } catch (err) {
+    console.error('[EXPIRY CHECKER]', err.message);
+  }
+}
+
+function startExpiryChecker(discordClient) {
+  console.log(`[EXPIRY] Checker started — auto-expire pending transactions after ${EXPIRY_HOURS}h`);
+  // Run immediately on startup, then on interval
+  checkAndExpireTransactions(discordClient);
+  setInterval(() => checkAndExpireTransactions(discordClient), EXPIRY_CHECK_INTERVAL);
+}
 
 // ========================================
 // BOT LOGIN + SHUTDOWN
