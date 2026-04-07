@@ -1,0 +1,16 @@
+{
+  "name": "irace-giftcard-bot",
+  "version": "1.0.0",
+  "description": "Discord Gift Card Store Bot — Irace Edition",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "install-and-start": "npm install && node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.26.2",
+    "express": "^4.22.1",
+    "mysql2": "^3.20.0",
+    "razorpay": "^2.9.6"
+  }
+}
