@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const {
   Client,
   GatewayIntentBits,
@@ -11,6 +13,7 @@ const {
   TextInputStyle,
   ChannelType,
   PermissionFlagsBits,
+  MessageFlags,
   REST,
   Routes,
   SlashCommandBuilder,
@@ -25,26 +28,27 @@ const Razorpay = require('razorpay');
 // ========================================
 
 const CONFIG = {
-  BOT_TOKEN: '',
+  BOT_TOKEN: process.env.BOT_TOKEN || '',
   DB: {
-    host: '104.234.180.242',
-    user: 'u82822_PZ9oYvFPp2',
-    password: '',
-    database: 's82822_vipshop',
+    host: process.env.DB_HOST || '104.234.180.242',
+    user: process.env.DB_USER || 'u82822_PZ9oYvFPp2',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 's82822_vipshop',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
     enableKeepAlive: true,
     keepAliveInitialDelay: 30000
   },
-  CHANNEL_ID: '1490955092541575180',
-  STATUS_CHANNEL_ID: '1490971944290488363',
-  QR_IMAGE: 'https://r2.fivemanage.com/Ys9r66xkAMyCtiby4q1Oj/QRZ.png',
-  STORE_LOGO: 'https://r2.fivemanage.com/Ys9r66xkAMyCtiby4q1Oj/GIFTCARDLOGO.png',
-  UPI_ID: 'davidbarma19@okicici',
-  ADMIN_ROLE: 'Admin',
-  WEBHOOK_PORT: process.env.PORT || 3001,
-  TEBEX_URL: 'https://projectirace.tebex.com',
+  CHANNEL_ID: process.env.CHANNEL_ID || '1490955092541575180',
+  STATUS_CHANNEL_ID: process.env.STATUS_CHANNEL_ID || '1490971944290488363',
+  QR_IMAGE: process.env.QR_IMAGE || 'https://r2.fivemanage.com/Ys9r66xkAMyCtiby4q1Oj/QRZ.png',
+  STORE_LOGO: process.env.STORE_LOGO || 'https://r2.fivemanage.com/Ys9r66xkAMyCtiby4q1Oj/GIFTCARDLOGO.png',
+  UPI_ID: process.env.UPI_ID || 'davidbarma19@okicici',
+  ADMIN_ROLE_IDS: (process.env.ADMIN_ROLE_IDS || '1475465692479361085,1471528112880746559').split(',').map(s => s.trim()).filter(Boolean),
+  SUPER_USER_IDS: (process.env.SUPER_USER_IDS || '879396413010743337,1054207830292447324,661812193242906675').split(',').map(s => s.trim()).filter(Boolean),
+  WEBHOOK_PORT: process.env.WEBHOOK_PORT || process.env.PORT || 3001,
+  TEBEX_URL: process.env.TEBEX_URL || 'https://projectirace.tebex.com',
 
   // Future payment gateways (not shown to users yet — manual UPI is primary)
   RAZORPAY: {
@@ -105,6 +109,14 @@ const commands = [
         )
     )
     .addStringOption(opt => opt.setName('code').setDescription('Gift card code').setRequired(true))
+    .addIntegerOption(opt =>
+      opt.setName('offer_pct').setDescription('Discount % for this denomination (e.g. 10 = 10% off). Clears offer if 0.')
+        .setRequired(false).setMinValue(0).setMaxValue(99)
+    )
+    .addIntegerOption(opt =>
+      opt.setName('offer_price').setDescription('Override: exact amount users pay (auto-calc from offer_pct if not set)')
+        .setRequired(false).setMinValue(1)
+    )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   new SlashCommandBuilder()
@@ -337,6 +349,33 @@ async function setConfig(key, value) {
     );
   } catch (err) {
     console.error('[CONFIG SET ERROR]', err.message);
+  }
+}
+
+async function saveOfferToDB(amount, offerData) {
+  const key = `offer_${amount}`;
+  await setConfig(key, offerData ? JSON.stringify(offerData) : null);
+}
+
+async function loadOffersFromDB() {
+  try {
+    for (const amount of CONFIG.PACKAGES) {
+      const raw = await getConfig(`offer_${amount}`);
+      if (raw === null || raw === undefined) continue;
+      if (raw === 'null' || raw === '') {
+        delete CONFIG.OFFERS[amount];
+      } else {
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed && parsed.pct !== undefined && parsed.price !== undefined) {
+            CONFIG.OFFERS[amount] = parsed;
+          }
+        } catch (_) {}
+      }
+    }
+    console.log('[OFFERS] Loaded custom offers from DB:', JSON.stringify(CONFIG.OFFERS));
+  } catch (err) {
+    console.error('[OFFERS LOAD ERROR]', err.message);
   }
 }
 
@@ -682,12 +721,15 @@ async function createTicket(guild, user, reason, paymentDetails) {
   const existing = guild.channels.cache.find(c => c.name === ticketName);
   if (existing) return existing;
 
-  const adminRole = guild.roles.cache.find(r => r.name === CONFIG.ADMIN_ROLE);
   const permOverwrites = [
     { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
     { id: user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] }
   ];
-  if (adminRole) permOverwrites.push({ id: adminRole.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] });
+  // Grant access to all configured admin roles
+  for (const roleId of CONFIG.ADMIN_ROLE_IDS) {
+    const role = guild.roles.cache.get(roleId);
+    if (role) permOverwrites.push({ id: role.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] });
+  }
 
   const ch = await guild.channels.create({ name: ticketName, type: ChannelType.GuildText, permissionOverwrites: permOverwrites });
   const embed = new EmbedBuilder()
@@ -884,6 +926,48 @@ async function postOrUpdateDashboard(client, isOnline = true) {
   }
 }
 
+// On startup / reconnect: delete old dashboard panel and post a fresh one
+async function cleanupAndPostDashboard(client) {
+  try {
+    const channel = await client.channels.fetch(CONFIG.STATUS_CHANNEL_ID).catch(() => null);
+    if (!channel) return;
+
+    const savedMsgId = await getConfig('dashboard_message_id');
+
+    if (savedMsgId) {
+      try {
+        const oldMsg = await channel.messages.fetch(savedMsgId);
+        await oldMsg.delete();
+        console.log(`[DASHBOARD CLEANUP] Deleted old dashboard panel (msg: ${savedMsgId})`);
+      } catch (_) {
+        console.log('[DASHBOARD CLEANUP] Old dashboard panel already gone or not found.');
+      }
+      await setConfig('dashboard_message_id', null);
+    }
+
+    // Also scan recent messages and delete any orphaned dashboard embeds from this bot
+    try {
+      const recent = await channel.messages.fetch({ limit: 20 });
+      const oldDashboards = recent.filter(m =>
+        m.author.id === client.user.id &&
+        m.embeds.length > 0 &&
+        (m.embeds[0]?.title?.includes('Bot Online') || m.embeds[0]?.title?.includes('Bot Offline'))
+      );
+      for (const [, m] of oldDashboards) {
+        await m.delete().catch(() => {});
+        console.log(`[DASHBOARD CLEANUP] Removed orphaned dashboard panel (msg: ${m.id})`);
+      }
+    } catch (_) {}
+
+    const embed = await buildDashboardEmbed(client.user.tag, true);
+    const msg = await channel.send({ embeds: [embed] });
+    await setConfig('dashboard_message_id', msg.id);
+    console.log('[DASHBOARD CLEANUP] Fresh dashboard panel posted.');
+  } catch (err) {
+    console.error('[DASHBOARD CLEANUP ERROR]', err.message);
+  }
+}
+
 async function postOrUpdateStore(client) {
   try {
     const channel = await client.channels.fetch(CONFIG.CHANNEL_ID).catch(() => null);
@@ -968,15 +1052,15 @@ client.once('clientReady', async () => {
     status: 'online'
   });
 
-  // Update bot profile picture to the Gift Card Store logo
+  // Update bot profile picture
   try {
-    await client.user.setAvatar('https://r2.fivemanage.com/Ys9r66xkAMyCtiby4q1Oj/GIFTCARDLOGO.png');
+    await client.user.setAvatar('https://r2.fivemanage.com/Ys9r66xkAMyCtiby4q1Oj/iracecoinzx.png');
     console.log('[BOT] Profile picture updated.');
   } catch (err) {
     console.warn('[BOT] Could not update avatar:', err.message);
   }
 
-  try { await createPool(); await initDatabase(); dbConnected = true; }
+  try { await createPool(); await initDatabase(); dbConnected = true; await loadOffersFromDB(); }
   catch (err) { console.error('[DB INIT ERROR]', err.message); await reconnectDB(); }
 
   try {
@@ -988,7 +1072,7 @@ client.once('clientReady', async () => {
   const startupStats = await runAutoDbSync('startup', 'system');
   if (startupStats) await postDbReport(client, startupStats, 'startup');
 
-  await postOrUpdateDashboard(client, true);
+  await cleanupAndPostDashboard(client);
   await cleanupAndPostStore(client);
 
   setInterval(async () => {
@@ -1009,8 +1093,8 @@ client.on('shardResume', async () => {
   try { await pool.query('SELECT 1'); dbConnected = true; } catch (_) { await reconnectDB(); }
   const reconnectStats = await runAutoDbSync('reconnect', 'system');
   if (reconnectStats) await postDbReport(client, reconnectStats, 'reconnect');
-  await postOrUpdateDashboard(client, true);
-  await postOrUpdateStore(client);
+  await cleanupAndPostDashboard(client);
+  await cleanupAndPostStore(client);
 });
 
 // ========================================
@@ -1018,18 +1102,21 @@ client.on('shardResume', async () => {
 // ========================================
 
 client.on('interactionCreate', async (interaction) => {
+  // Guard: ignore if Discord already received a response for this interaction
+  if (interaction.replied || interaction.deferred) return;
+
   try {
 
     // ---- /dashboard ----
     if (interaction.isChatInputCommand() && interaction.commandName === 'dashboard') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       await interaction.editReply({ embeds: [await buildDashboardEmbed(client.user.tag, true)] });
       return;
     }
 
     // ---- /dbstatus ----
     if (interaction.isChatInputCommand() && interaction.commandName === 'dbstatus') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const logs = await getRecentSyncLogs(10);
       const lines = logs.length > 0
         ? logs.map((r, i) => {
@@ -1050,7 +1137,7 @@ client.on('interactionCreate', async (interaction) => {
 
     // ---- /dbsync ----
     if (interaction.isChatInputCommand() && interaction.commandName === 'dbsync') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const stats = await runAutoDbSync('manual', interaction.user.tag);
       if (!stats) { await interaction.editReply('❌ DB sync failed. Check console.'); return; }
       await postDbReport(client, stats, 'manual');
@@ -1069,18 +1156,51 @@ client.on('interactionCreate', async (interaction) => {
 
     // ---- /store ----
     if (interaction.isChatInputCommand() && interaction.commandName === 'store') {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const embed = await buildStoreEmbed();
       const row = await buildStoreRow();
       const msg = await interaction.channel.send({ embeds: [embed], components: [row] });
       await setConfig('store_message_id', msg.id);
-      await interaction.reply({ content: '✅ Store embed posted!', ephemeral: true });
+      await interaction.editReply({ content: '✅ Store embed posted!' });
       return;
     }
 
     // ---- /addcard ----
     if (interaction.isChatInputCommand() && interaction.commandName === 'addcard') {
-      const amount = interaction.options.getInteger('amount');
-      const code = interaction.options.getString('code').trim();
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const amount    = interaction.options.getInteger('amount');
+      const code      = interaction.options.getString('code').trim();
+      const offerPct  = interaction.options.getInteger('offer_pct');   // null if not provided
+      const offerPrice = interaction.options.getInteger('offer_price'); // null if not provided
+
+      // ---- Process offer update ----
+      let offerChanged = false;
+      let newOffer = null;
+
+      if (offerPct !== null) {
+        if (offerPct === 0) {
+          // Remove any existing offer for this denomination
+          delete CONFIG.OFFERS[amount];
+          await saveOfferToDB(amount, null);
+          offerChanged = true;
+        } else {
+          // Calculate pay price: use explicit offer_price if given, else calculate from pct
+          const calcPrice = offerPrice !== null ? offerPrice : Math.round(amount * (1 - offerPct / 100));
+          newOffer = { pct: offerPct, price: calcPrice };
+          CONFIG.OFFERS[amount] = newOffer;
+          await saveOfferToDB(amount, newOffer);
+          offerChanged = true;
+        }
+      } else if (offerPrice !== null) {
+        // offer_price set but no offer_pct — derive pct from price
+        const pct = Math.round((1 - offerPrice / amount) * 100);
+        newOffer = { pct, price: offerPrice };
+        CONFIG.OFFERS[amount] = newOffer;
+        await saveOfferToDB(amount, newOffer);
+        offerChanged = true;
+      }
+
+      // ---- Insert card ----
       try {
         await pool.query('INSERT INTO gift_cards (amount, code) VALUES (?, ?)', [amount, code]);
         const [[{ available }]] = await pool.query(
@@ -1088,24 +1208,35 @@ client.on('interactionCreate', async (interaction) => {
         );
         const [[cfg]] = await pool.query('SELECT * FROM stock_config WHERE amount = ?', [amount]);
         await recordManualAdd(amount, interaction.user.id);
-        await interaction.reply({
+
+        const currentOffer = CONFIG.OFFERS[amount];
+        const offerField = currentOffer
+          ? `🏷️ **${currentOffer.pct}% OFF** — Pay ₹${currentOffer.price} (face value ₹${amount})`
+          : '—  No offer (sold at face value)';
+        const offerStatusLine = offerChanged
+          ? (newOffer
+              ? `\n✅ **Offer updated:** ${newOffer.pct}% OFF → Pay ₹${newOffer.price}`
+              : '\n🚫 **Offer removed** — sold at face value ₹' + amount)
+          : '';
+
+        await interaction.editReply({
           embeds: [new EmbedBuilder().setTitle('✅ Gift Card Added')
+            .setDescription(`Card added to inventory.${offerStatusLine}`)
             .addFields(
-              { name: '💰 Amount', value: `₹${amount}`, inline: true },
+              { name: '💰 Face Value', value: `₹${amount}`, inline: true },
               { name: '🎁 Code', value: `\`${code}\``, inline: true },
               { name: '📦 Available Codes', value: `${available}`, inline: true },
+              { name: '🏷️ Current Offer', value: offerField, inline: false },
               { name: '📊 Stock Progress', value: `\`${stockBar(cfg.sold_count, cfg.max_stock)}\``, inline: false }
             )
-            .setColor(0x00FF00).setTimestamp()],
-          ephemeral: true
+            .setColor(0x00FF00).setTimestamp()]
         });
-        await logAction('CARD_ADDED', interaction.user.id, `₹${amount}: ${code}`);
+        await logAction('CARD_ADDED', interaction.user.id, `₹${amount}: ${code}${offerChanged ? ` | Offer: ${newOffer ? newOffer.pct + '%' : 'removed'}` : ''}`);
         await postOrUpdateDashboard(client, true);
         await postOrUpdateStore(client);
       } catch (err) {
-        if (err.code === 'ER_DUP_ENTRY') return interaction.reply({
-          embeds: [new EmbedBuilder().setTitle('❌ Duplicate Code').setDescription('This code already exists.').setColor(0xFF0000)],
-          ephemeral: true
+        if (err.code === 'ER_DUP_ENTRY') return interaction.editReply({
+          embeds: [new EmbedBuilder().setTitle('❌ Duplicate Code').setDescription('This code already exists.').setColor(0xFF0000)]
         });
         throw err;
       }
@@ -1114,6 +1245,7 @@ client.on('interactionCreate', async (interaction) => {
 
     // ---- /stock ----
     if (interaction.isChatInputCommand() && interaction.commandName === 'stock') {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const embed = new EmbedBuilder().setTitle('📦 Gift Card Stock Report').setColor(0x5865F2).setTimestamp();
       let totalAvail = 0, totalSold = 0;
 
@@ -1132,26 +1264,26 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       embed.setFooter({ text: `Total available: ${totalAvail} | Total sold: ${totalSold}` });
-      await interaction.reply({ embeds: [embed], ephemeral: true });
+      await interaction.editReply({ embeds: [embed] });
       return;
     }
 
     // ---- /setstock ----
     if (interaction.isChatInputCommand() && interaction.commandName === 'setstock') {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const amount = interaction.options.getInteger('amount');
       const newLimit = interaction.options.getInteger('limit');
       const [[prev]] = await pool.query('SELECT * FROM stock_config WHERE amount = ?', [amount]);
       await pool.query('UPDATE stock_config SET max_stock = ?, updated_at = NOW() WHERE amount = ?', [newLimit, amount]);
       await recordRestock(amount, newLimit, interaction.user.id, `Limit changed from ${prev.max_stock} to ${newLimit}`);
-      await interaction.reply({
+      await interaction.editReply({
         embeds: [new EmbedBuilder().setTitle('⚙️ Stock Limit Updated')
           .addFields(
             { name: '💰 Package', value: `₹${amount}`, inline: true },
             { name: '📉 Old Limit', value: `${prev.max_stock}`, inline: true },
             { name: '📈 New Limit', value: `${newLimit}`, inline: true }
           )
-          .setColor(0x5865F2).setTimestamp()],
-        ephemeral: true
+          .setColor(0x5865F2).setTimestamp()]
       });
       await logAction('STOCK_LIMIT_CHANGED', interaction.user.id, `₹${amount}: ${prev.max_stock} → ${newLimit}`);
       await postOrUpdateDashboard(client, true);
@@ -1161,6 +1293,7 @@ client.on('interactionCreate', async (interaction) => {
 
     // ---- /restockall ----
     if (interaction.isChatInputCommand() && interaction.commandName === 'restockall') {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       for (const amt of CONFIG.PACKAGES) {
         const [[prev]] = await pool.query('SELECT * FROM stock_config WHERE amount = ?', [amt]);
         await pool.query('UPDATE stock_config SET sold_count = 0, last_restocked = NOW() WHERE amount = ?', [amt]);
@@ -1179,7 +1312,7 @@ client.on('interactionCreate', async (interaction) => {
         embed.addFields({ name: `₹${amt}`, value: `\`${stockBar(0, cfg.max_stock)}\` — ${cfg.max_stock} available`, inline: true });
       }
 
-      await interaction.reply({ embeds: [embed], ephemeral: true });
+      await interaction.editReply({ embeds: [embed] });
       await logAction('RESTOCK_ALL', interaction.user.id, 'All packages restocked');
       await postOrUpdateDashboard(client, true);
       await postOrUpdateStore(client);
@@ -1188,6 +1321,7 @@ client.on('interactionCreate', async (interaction) => {
 
     // ---- /transactions ----
     if (interaction.isChatInputCommand() && interaction.commandName === 'transactions') {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const limit = interaction.options.getInteger('limit') || 10;
       const [rows] = await pool.query('SELECT * FROM transactions ORDER BY created_at DESC LIMIT ?', [limit]);
       const embed = new EmbedBuilder().setTitle('📊 Recent Transactions').setColor(0x5865F2).setTimestamp()
@@ -1205,30 +1339,31 @@ client.on('interactionCreate', async (interaction) => {
           });
         });
       }
-      await interaction.reply({ embeds: [embed], ephemeral: true });
+      await interaction.editReply({ embeds: [embed] });
       return;
     }
 
     // ---- DROPDOWN: Amount Selection ----
     if (interaction.isStringSelectMenu() && interaction.customId === 'select_amount') {
+      // Defer immediately — DB queries below can exceed Discord's 3-second window
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
       const amount = parseInt(interaction.values[0]);
       const s = await getStockStatus(amount);
 
       if (s && s.is_sold_out) {
-        return interaction.reply({
+        return interaction.editReply({
           embeds: [new EmbedBuilder().setTitle('🔴 Package Sold Out')
             .setDescription(`The **₹${amount}** gift card is currently **sold out** (${s.sold_count}/${s.max_stock} sold).\n\nPlease check back later or contact support.`)
-            .setColor(0xFF0000)],
-          ephemeral: true
+            .setColor(0xFF0000)]
         });
       }
 
       if (await hasPendingPayment(interaction.user.id)) {
-        return interaction.reply({
+        return interaction.editReply({
           embeds: [new EmbedBuilder().setTitle('⚠️ Pending Payment')
             .setDescription('You already have a payment waiting for review. Please wait before making a new purchase.')
-            .setColor(0xFFA500)],
-          ephemeral: true
+            .setColor(0xFFA500)]
         });
       }
 
@@ -1259,7 +1394,7 @@ client.on('interactionCreate', async (interaction) => {
         .setTimestamp()
         .setFooter({ text: `₹${amount} Gift Card | Pay ₹${payPrice} | ${s ? s.remaining : '?'} remaining` });
 
-      await interaction.reply({
+      await interaction.editReply({
         embeds: [embed],
         components: [
           new ActionRowBuilder().addComponents(
@@ -1269,8 +1404,7 @@ client.on('interactionCreate', async (interaction) => {
               .setEmoji('📝')
               .setStyle(ButtonStyle.Success)
           )
-        ],
-        ephemeral: true
+        ]
       });
 
       await logAction('AMOUNT_SELECTED', interaction.user.id, `₹${amount} (pay ₹${payPrice})`);
@@ -1329,27 +1463,30 @@ client.on('interactionCreate', async (interaction) => {
 
     // ---- MODAL: Manual Submit ----
     if (interaction.isModalSubmit() && interaction.customId.startsWith('manual_modal_')) {
+      // Defer immediately — remote DB operations easily exceed Discord's 3-second window.
+      // This keeps the interaction alive for up to 15 minutes so the admin notification
+      // is always sent regardless of how long the DB insert takes.
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
       const amount = parseInt(interaction.customId.split('_')[2]);
       const payPrice = getPayPrice(amount);
       const offer = CONFIG.OFFERS[amount];
 
-      const upiTxn    = interaction.fields.getTextInputValue('upi_txn').trim();
-      const sender    = interaction.fields.getTextInputValue('sender_name').trim();
-      const payApp    = interaction.fields.getTextInputValue('payment_app').trim();
+      const upiTxn     = interaction.fields.getTextInputValue('upi_txn').trim();
+      const sender     = interaction.fields.getTextInputValue('sender_name').trim();
+      const payApp     = interaction.fields.getTextInputValue('payment_app').trim();
       const gatewayTxn = interaction.fields.getTextInputValue('gateway_txn').trim() || null;
 
-      if (await isDuplicateTxn(upiTxn)) return interaction.reply({
+      if (await isDuplicateTxn(upiTxn)) return interaction.editReply({
         embeds: [new EmbedBuilder().setTitle('❌ Duplicate Transaction')
           .setDescription('This UPI Transaction ID has already been submitted.')
-          .setColor(0xFF0000)],
-        ephemeral: true
+          .setColor(0xFF0000)]
       });
 
-      if (await hasPendingPayment(interaction.user.id)) return interaction.reply({
+      if (await hasPendingPayment(interaction.user.id)) return interaction.editReply({
         embeds: [new EmbedBuilder().setTitle('⚠️ Pending Payment')
           .setDescription('You already have a payment under review. Please wait.')
-          .setColor(0xFFA500)],
-        ephemeral: true
+          .setColor(0xFFA500)]
       });
 
       const [result] = await pool.query(
@@ -1358,7 +1495,8 @@ client.on('interactionCreate', async (interaction) => {
       );
       const txnId = result.insertId;
 
-      await interaction.reply({
+      // Reply to user first, then send admin notification — both are now guaranteed to run
+      await interaction.editReply({
         embeds: [new EmbedBuilder()
           .setTitle('✅ Payment Submitted for Review')
           .setDescription('Your payment details have been submitted.\nAn admin will verify and deliver your gift card via DM.')
@@ -1369,8 +1507,7 @@ client.on('interactionCreate', async (interaction) => {
             { name: '📱 UPI Txn ID', value: `\`${upiTxn}\``, inline: false }
           )
           .setColor(0x00FF00).setTimestamp()
-          .setFooter({ text: 'Please keep your UPI transaction ID safe' })],
-        ephemeral: true
+          .setFooter({ text: 'Please keep your UPI transaction ID safe' })]
       });
 
       // Admin notification
@@ -1434,14 +1571,15 @@ client.on('interactionCreate', async (interaction) => {
       const [, txnId, userId, amountStr] = parts;
       const amount = parseInt(amountStr);
 
-      const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator) ||
-                      interaction.member.roles.cache.some(r => r.name === CONFIG.ADMIN_ROLE);
+      const isAdmin = CONFIG.SUPER_USER_IDS.includes(interaction.user.id) ||
+                      interaction.member.permissions.has(PermissionFlagsBits.Administrator) ||
+                      CONFIG.ADMIN_ROLE_IDS.some(id => interaction.member.roles.cache.has(id));
       if (!isAdmin) return interaction.reply({
         embeds: [new EmbedBuilder().setTitle('❌ Access Denied').setDescription('Admins only.').setColor(0xFF0000)],
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
 
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       await pool.query('UPDATE transactions SET status = "approved" WHERE id = ?', [txnId]);
       const delivered = await deliverGiftCard(client, userId, amount, `manual-${txnId}`);
 
@@ -1494,12 +1632,16 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isButton() && interaction.customId.startsWith('reject_')) {
       const [, txnId, userId] = interaction.customId.split('_');
 
-      const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator) ||
-                      interaction.member.roles.cache.some(r => r.name === CONFIG.ADMIN_ROLE);
+      const isAdmin = CONFIG.SUPER_USER_IDS.includes(interaction.user.id) ||
+                      interaction.member.permissions.has(PermissionFlagsBits.Administrator) ||
+                      CONFIG.ADMIN_ROLE_IDS.some(id => interaction.member.roles.cache.has(id));
       if (!isAdmin) return interaction.reply({
         embeds: [new EmbedBuilder().setTitle('❌ Access Denied').setDescription('Admins only.').setColor(0xFF0000)],
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
+
+      // Defer immediately — DB update + DM + message edit can exceed Discord's 3-second window
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       await pool.query('UPDATE transactions SET status = "rejected" WHERE id = ?', [txnId]);
 
@@ -1519,11 +1661,10 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.message.edit({ embeds: [updatedEmbed], components: [] });
       } catch (_) {}
 
-      await interaction.reply({
+      await interaction.editReply({
         embeds: [new EmbedBuilder().setTitle('❌ Payment Rejected')
           .setDescription(`Transaction #${txnId} rejected. User has been notified.`)
-          .setColor(0xFF0000)],
-        ephemeral: true
+          .setColor(0xFF0000)]
       });
       await logAction('REJECTED', interaction.user.id, `Txn #${txnId}, User: ${userId}`);
 
@@ -1554,12 +1695,18 @@ client.on('interactionCreate', async (interaction) => {
     }
 
   } catch (err) {
+    // Suppress "already acknowledged" errors — these are harmless race conditions
+    if (err?.code === 40060) return;
     console.error('[INTERACTION ERROR]', err);
-    const replyFn = interaction.deferred || interaction.replied ? interaction.editReply.bind(interaction) : interaction.reply.bind(interaction);
-    await replyFn({
-      embeds: [new EmbedBuilder().setTitle('❌ Error').setDescription('An unexpected error occurred. Please try again.').setColor(0xFF0000)],
-      ephemeral: true
-    }).catch(() => {});
+    try {
+      const replyFn = interaction.deferred || interaction.replied
+        ? interaction.editReply.bind(interaction)
+        : interaction.reply.bind(interaction);
+      await replyFn({
+        embeds: [new EmbedBuilder().setTitle('❌ Error').setDescription('An unexpected error occurred. Please try again.').setColor(0xFF0000)],
+        flags: MessageFlags.Ephemeral
+      });
+    } catch (_) {}
   }
 });
 
