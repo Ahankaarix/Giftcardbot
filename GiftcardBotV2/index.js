@@ -49,9 +49,10 @@ const CONFIG = {
   },
   CHANNEL_ID: process.env.CHANNEL_ID || '1490955092541575180',
   STATUS_CHANNEL_ID: process.env.STATUS_CHANNEL_ID || '1490971944290488363',
-  QR_IMAGE: process.env.QR_IMAGE || 'https://r2.fivemanage.com/Ys9r66xkAMyCtiby4q1Oj/QRZ.png',
+  QR_IMAGE: process.env.QR_IMAGE || 'https://r2.fivemanage.com/Ys9r66xkAMyCtiby4q1Oj/kotakupi.png',
   STORE_LOGO: process.env.STORE_LOGO || 'https://r2.fivemanage.com/Ys9r66xkAMyCtiby4q1Oj/GIFTCARDLOGO.png',
   UPI_ID: process.env.UPI_ID || 'davidbarma19@okicici',
+  PAYPAL_ID: process.env.PAYPAL_ID || 'jarmantyson@gmail.com',
   ADMIN_ROLE_IDS: (process.env.ADMIN_ROLE_IDS || '1475465692479361085,1471528112880746559').split(',').map(s => s.trim()).filter(Boolean),
   SUPER_USER_IDS: (process.env.SUPER_USER_IDS || '879396413010743337,1054207830292447324,661812193242906675').split(',').map(s => s.trim()).filter(Boolean),
   WEBHOOK_PORT: process.env.WEBHOOK_PORT || process.env.PORT || 3001,
@@ -96,6 +97,7 @@ function getOfferLabel(faceValue) {
   return `${o.pct}% OFF — Pay ₹${o.price}`;
 }
 
+
 // ========================================
 // SLASH COMMAND DEFINITIONS
 // ========================================
@@ -129,6 +131,11 @@ const commands = [
   new SlashCommandBuilder()
     .setName('stock')
     .setDescription('Check gift card stock with limits (Admin only)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  new SlashCommandBuilder()
+    .setName('syncstock')
+    .setDescription('Force a full SQL→Discord stock reconciliation and refresh all embeds (Admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   new SlashCommandBuilder()
@@ -421,13 +428,25 @@ async function runAutoDbSync(syncType = 'scheduled', triggeredBy = 'system') {
     ]);
 
     dbConnected = true;
+    conn.release();
+
+    // Reconcile stock_config against actual gift_cards table to fix any drift
+    const reconciledStock = await reconcileStockFromDB().catch(err => {
+      console.error('[STOCK RECONCILE ERROR]', err.message);
+      return null;
+    });
+
+    const driftedPackages = reconciledStock ? reconciledStock.filter(s => s.drifted).map(s => `₹${s.amount}`) : [];
+    if (driftedPackages.length > 0) {
+      console.log(`[DB SYNC] Stock drift corrected for: ${driftedPackages.join(', ')}`);
+    }
+
     console.log(`[DB SYNC] ${syncType} sync complete — ${total_gift_cards} cards, ${total_transactions} txns`);
-    return { total_gift_cards, available_cards, total_transactions, pending_transactions, total_stock_events };
+    return { total_gift_cards, available_cards, total_transactions, pending_transactions, total_stock_events, reconciledStock };
   } catch (err) {
     console.error('[DB SYNC ERROR]', err.message);
-    return null;
-  } finally {
     conn.release();
+    return null;
   }
 }
 
@@ -457,13 +476,24 @@ async function postDbReport(client, stats, syncType = 'scheduled') {
 
     const icons = { startup: '🚀', reconnect: '🔄', manual: '🛠️', scheduled: '⏰' };
 
+    // Build per-denomination stock breakdown if reconciliation data is present
+    let stockBreakdown = '—';
+    if (stats.reconciledStock && stats.reconciledStock.length > 0) {
+      stockBreakdown = stats.reconciledStock.map(r => {
+        const icon = r.is_sold_out ? '🔴' : r.is_low_stock ? '🟡' : '🟢';
+        const drift = r.drifted ? ' ⚠️' : '';
+        return `${icon} **₹${r.amount}**: ${r.avail_codes}/${r.total_codes} unused${drift}`;
+      }).join('\n');
+    }
+
     const embed = new EmbedBuilder()
       .setTitle(`${icons[syncType] || '🔄'} Database Sync — ${syncType.charAt(0).toUpperCase() + syncType.slice(1)}`)
-      .setDescription(`Auto SQL sync completed. All tables verified.`)
+      .setDescription(`Auto SQL sync completed. All tables verified and stock reconciled.`)
       .addFields(
         { name: '🎁 Gift Cards', value: `Total: **${stats.total_gift_cards}** | Available: **${stats.available_cards}**`, inline: true },
         { name: '💳 Transactions', value: `Total: **${stats.total_transactions}** | Pending: **${stats.pending_transactions}**`, inline: true },
         { name: '📊 Stock Events', value: `**${stats.total_stock_events}** recorded`, inline: true },
+        { name: '📦 Per-Denomination Stock (from SQL)', value: stockBreakdown, inline: false },
         { name: '🗄️ Tables Verified', value: '`gift_cards` `transactions` `action_logs`\n`bot_config` `stock_config` `stock_history` `db_sync_log`', inline: false },
         { name: '📋 Recent Sync History', value: historyText, inline: false }
       )
@@ -493,20 +523,27 @@ async function postDbReport(client, stats, syncType = 'scheduled') {
 async function getStockStatus(amount) {
   const [[cfg]] = await pool.query('SELECT * FROM stock_config WHERE amount = ?', [amount]);
   if (!cfg) return null;
-  const [[{ available }]] = await pool.query(
-    'SELECT COUNT(*) as available FROM gift_cards WHERE amount = ? AND is_used = 0', [amount]
-  );
-  const slotsLeft = cfg.max_stock - cfg.sold_count;
-  const remaining = Math.max(0, Math.min(available, slotsLeft));
+  // Count actual unused and used codes directly from gift_cards — never cap by max_stock
+  const [[counts]] = await pool.query(`
+    SELECT
+      SUM(CASE WHEN is_used = 0 THEN 1 ELSE 0 END) AS available,
+      SUM(CASE WHEN is_used = 1 THEN 1 ELSE 0 END) AS used_count,
+      COUNT(*) AS total_codes
+    FROM gift_cards WHERE amount = ?
+  `, [amount]);
+  const available  = Number(counts.available)   || 0;
+  const used_count = Number(counts.used_count)  || 0;
+  const total      = Number(counts.total_codes) || 0;
   return {
     amount,
-    max_stock: cfg.max_stock,
-    sold_count: cfg.sold_count,
+    max_stock:       cfg.max_stock,
+    sold_count:      used_count,   // actual used, not the tracked counter
     available_codes: available,
-    remaining,
-    is_sold_out: remaining <= 0,
-    is_low_stock: remaining > 0 && remaining <= cfg.low_stock_threshold,
-    pct: Math.round((cfg.sold_count / cfg.max_stock) * 100)
+    total_codes:     total,
+    remaining:       available,    // = actual unused codes in DB, no cap
+    is_sold_out:     available <= 0,
+    is_low_stock:    available > 0 && available <= cfg.low_stock_threshold,
+    pct:             total > 0 ? Math.round((used_count / total) * 100) : 0
   };
 }
 
@@ -547,9 +584,62 @@ async function recordManualAdd(amount, performedBy) {
 }
 
 function stockBar(sold, max) {
-  const filled = Math.round((sold / max) * 10);
+  const filled = max > 0 ? Math.round((sold / max) * 10) : 0;
   const empty = 10 - filled;
   return '█'.repeat(filled) + '░'.repeat(empty) + ` ${sold}/${max} sold`;
+}
+
+// ========================================
+// STOCK RECONCILIATION (SQL → Discord)
+// ========================================
+// Reads actual gift_cards table, corrects stock_config drift, returns per-denom breakdown.
+
+async function reconcileStockFromDB() {
+  const results = [];
+  const conn = await pool.getConnection();
+  try {
+    for (const amt of CONFIG.PACKAGES) {
+      const [[counts]] = await conn.query(`
+        SELECT
+          COUNT(*)                        AS total_codes,
+          SUM(CASE WHEN is_used = 0 THEN 1 ELSE 0 END) AS available_codes,
+          SUM(CASE WHEN is_used = 1 THEN 1 ELSE 0 END) AS used_codes
+        FROM gift_cards WHERE amount = ?
+      `, [amt]);
+
+      const total    = Number(counts.total_codes)     || 0;
+      const avail    = Number(counts.available_codes) || 0;
+      const used     = Number(counts.used_codes)      || 0;
+
+      // Fetch current stock_config
+      const [[cfg]] = await conn.query('SELECT * FROM stock_config WHERE amount = ?', [amt]);
+      const prevSold = cfg ? cfg.sold_count  : 0;
+      const maxStock = cfg ? cfg.max_stock   : CONFIG.DEFAULT_MAX_STOCK;
+
+      // Correct sold_count to match actual used codes
+      if (cfg && cfg.sold_count !== used) {
+        await conn.query('UPDATE stock_config SET sold_count = ?, updated_at = NOW() WHERE amount = ?', [used, amt]);
+        console.log(`[STOCK RECONCILE] ₹${amt}: sold_count corrected ${prevSold} → ${used}`);
+      }
+
+      const remaining = Math.max(0, avail);
+      results.push({
+        amount:      amt,
+        total_codes: total,
+        avail_codes: avail,
+        used_codes:  used,
+        max_stock:   maxStock,
+        sold_count:  used,
+        remaining,
+        drifted:     prevSold !== used,
+        is_sold_out: remaining === 0,
+        is_low_stock: remaining > 0 && remaining <= (cfg?.low_stock_threshold || CONFIG.LOW_STOCK_THRESHOLD)
+      });
+    }
+    return results;
+  } finally {
+    conn.release();
+  }
 }
 
 // ========================================
@@ -650,19 +740,7 @@ async function deliverGiftCard(client, userId, amount, paymentId) {
   try {
     await conn.beginTransaction();
 
-    const [[cfg]] = await conn.query('SELECT * FROM stock_config WHERE amount = ? FOR UPDATE', [amount]);
-    if (cfg && cfg.sold_count >= cfg.max_stock) {
-      await conn.rollback();
-      console.log(`[STOCK] Sold out: ₹${amount} (${cfg.sold_count}/${cfg.max_stock})`);
-      const guild = client.guilds.cache.first();
-      if (guild) {
-        const user = await client.users.fetch(userId).catch(() => null);
-        if (user) await createTicket(guild, user, `₹${amount} package is sold out (${cfg.sold_count}/${cfg.max_stock} sold)`, { amount, paymentId });
-      }
-      await logAction('STOCK_LIMIT_HIT', userId, `₹${amount}: ${cfg.sold_count}/${cfg.max_stock}`);
-      return false;
-    }
-
+    // Only check actual available codes — max_stock cap removed so real DB count drives delivery
     const [rows] = await conn.query(
       'SELECT * FROM gift_cards WHERE amount = ? AND is_used = 0 LIMIT 1 FOR UPDATE', [amount]
     );
@@ -798,13 +876,13 @@ async function buildStoreEmbed() {
     .setTitle('🎁 Gift Card Store')
     .setDescription(
       '**Welcome to the Gift Card Store!**\n\n' +
-      'Purchase gift cards instantly using UPI.\n\n' +
+      'Purchase gift cards instantly using **UPI** or **PayPal**.\n\n' +
       '**How it works:**\n' +
       '1️⃣ Select a gift card amount from the dropdown below\n' +
-      '2️⃣ Scan the QR code or use the UPI ID to pay\n' +
+      '2️⃣ Pay via UPI (scan QR) or PayPal — your choice\n' +
       '3️⃣ Submit your transaction details\n' +
       '4️⃣ Receive your gift card via DM after admin approval\n\n' +
-      '🔒 Secure | 📱 UPI | 🎁 Quick Delivery'
+      '🔒 Secure | 📱 UPI or 🅿️ PayPal | 🎁 Quick Delivery'
     )
     .addFields({ name: '📦 Current Stock & Offers', value: stockLines, inline: false })
     .setColor(0x5865F2)
@@ -869,11 +947,13 @@ async function buildDashboardEmbed(botTag, isOnline = true) {
     stockSection = CONFIG.PACKAGES.map(amt => {
       const s = stockAll[amt];
       if (!s) return `₹${amt} — N/A`;
-      const bar = stockBar(s.sold_count, s.max_stock);
+      // Bar shows used vs total codes in DB (not capped by max_stock)
+      const total = s.total_codes || (s.sold_count + s.available_codes);
+      const bar = stockBar(s.sold_count, Math.max(total, 1));
       const status = s.is_sold_out ? '🔴 SOLD OUT' : s.is_low_stock ? '🟡 LOW' : '🟢 OK';
       const offer = CONFIG.OFFERS[amt];
       const offerStr = offer ? ` 🏷️${offer.pct}%OFF` : '';
-      return `**₹${amt}**${offerStr} ${status}\n\`${bar}\`\n${s.remaining} remaining / ${s.max_stock} limit`;
+      return `**₹${amt}**${offerStr} ${status}\n\`${bar}\`\n${s.remaining} available in DB`;
     }).join('\n\n');
 
     const [[{ total }]] = await pool.query('SELECT COUNT(*) as total FROM transactions WHERE status IN ("approved","captured")');
@@ -1090,6 +1170,8 @@ client.once('clientReady', async () => {
   await cleanupAndPostStore(client);
 
   setInterval(async () => {
+    // Reconcile stock from DB first, then refresh Discord embeds
+    await reconcileStockFromDB().catch(err => console.error('[AUTO RECONCILE]', err.message));
     await postOrUpdateDashboard(client, true);
     await postOrUpdateStore(client);
   }, 5 * 60 * 1000);
@@ -1262,25 +1344,97 @@ client.on('interactionCreate', async (interaction) => {
     // ---- /stock ----
     if (interaction.isChatInputCommand() && interaction.commandName === 'stock') {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      const embed = new EmbedBuilder().setTitle('📦 Gift Card Stock Report').setColor(0x5865F2).setTimestamp();
-      let totalAvail = 0, totalSold = 0;
+
+      // Run a fresh reconciliation so numbers are always accurate
+      const reconData = await reconcileStockFromDB().catch(() => null);
+      const embed = new EmbedBuilder()
+        .setTitle('📦 Gift Card Stock — Live SQL Report')
+        .setDescription('Stock counts read **directly from the database** and reconciled with tracking config.')
+        .setColor(0x5865F2).setTimestamp();
+
+      let totalAvail = 0, totalUsed = 0, totalCodes = 0;
 
       for (const amt of CONFIG.PACKAGES) {
-        const s = await getStockStatus(amt);
+        const r = reconData ? reconData.find(x => x.amount === amt) : null;
+        const s = r || await getStockStatus(amt);
         const offer = CONFIG.OFFERS[amt];
         const offerStr = offer ? ` 🏷️ ${offer.pct}% OFF (₹${offer.price})` : '';
-        const status = s.is_sold_out ? '🔴 SOLD OUT' : s.is_low_stock ? `🟡 LOW STOCK (${s.remaining} left)` : `🟢 ${s.remaining} available`;
+
+        const avail   = r ? r.avail_codes : (s.available_codes ?? s.remaining);
+        const used    = r ? r.used_codes  : s.sold_count;
+        const total   = r ? r.total_codes : (avail + used);
+        const maxS    = r ? r.max_stock   : s.max_stock;
+        const drifted = r ? r.drifted     : false;
+
+        const statusIcon = avail === 0 ? '🔴' : avail <= (CONFIG.LOW_STOCK_THRESHOLD) ? '🟡' : '🟢';
+        const statusTxt  = avail === 0 ? 'SOLD OUT' : avail <= CONFIG.LOW_STOCK_THRESHOLD ? `LOW STOCK` : 'In Stock';
+
         embed.addFields({
           name: `₹${amt} Package${offerStr}`,
-          value: `${status}\n\`${stockBar(s.sold_count, s.max_stock)}\`\nLimit: **${s.max_stock}** | Sold: **${s.sold_count}** | Codes in DB: **${s.available_codes}**`,
+          value: [
+            `${statusIcon} **${statusTxt}** — ${avail} of ${total} codes available`,
+            `\`${stockBar(used, Math.max(total, 1))}\``,
+            `🗄️ DB: **${total}** total | **${avail}** unused | **${used}** used`,
+            `⚙️ Config limit: **${maxS}**${drifted ? ' ⚠️ *drift corrected*' : ''}`
+          ].join('\n'),
           inline: false
         });
-        totalAvail += s.remaining;
-        totalSold += s.sold_count;
+
+        totalAvail += avail;
+        totalUsed  += used;
+        totalCodes += total;
       }
 
-      embed.setFooter({ text: `Total available: ${totalAvail} | Total sold: ${totalSold}` });
+      embed.setFooter({ text: `SQL Total: ${totalCodes} codes | ${totalAvail} available | ${totalUsed} used | Synced ${new Date().toLocaleString('en-IN')}` });
       await interaction.editReply({ embeds: [embed] });
+      return;
+    }
+
+    // ---- /syncstock ----
+    if (interaction.isChatInputCommand() && interaction.commandName === 'syncstock') {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+      const reconData = await reconcileStockFromDB().catch(err => {
+        console.error('[SYNCSTOCK]', err.message);
+        return null;
+      });
+
+      if (!reconData) {
+        return interaction.editReply({
+          embeds: [new EmbedBuilder().setTitle('❌ Sync Failed').setDescription('Could not connect to database.').setColor(0xFF0000)]
+        });
+      }
+
+      const drifted = reconData.filter(s => s.drifted);
+      const embed = new EmbedBuilder()
+        .setTitle('🔄 SQL → Discord Stock Sync Complete')
+        .setDescription(
+          drifted.length > 0
+            ? `✅ Reconciliation done. **${drifted.length}** package(s) had drift and were corrected.`
+            : '✅ All packages are in sync — no drift detected.'
+        )
+        .setColor(0x00FF7F).setTimestamp();
+
+      for (const r of reconData) {
+        const offer = CONFIG.OFFERS[r.amount];
+        const offerStr = offer ? ` 🏷️ ${offer.pct}% OFF` : '';
+        const statusIcon = r.is_sold_out ? '🔴' : r.is_low_stock ? '🟡' : '🟢';
+        embed.addFields({
+          name: `₹${r.amount}${offerStr}`,
+          value: [
+            `${statusIcon} **${r.avail_codes}** available / **${r.total_codes}** total in DB`,
+            r.drifted ? `⚠️ Drift fixed: sold_count corrected to **${r.used_codes}**` : `✅ In sync`
+          ].join('\n'),
+          inline: true
+        });
+      }
+
+      await interaction.editReply({ embeds: [embed] });
+
+      // Refresh Discord embeds to reflect corrected stock
+      await postOrUpdateDashboard(client, true);
+      await postOrUpdateStore(client);
+      await logAction('SYNCSTOCK', interaction.user.id, `Manual SQL sync — ${drifted.length} drift(s) corrected`);
       return;
     }
 
@@ -1324,8 +1478,10 @@ client.on('interactionCreate', async (interaction) => {
         .setColor(0x00FF00).setTimestamp();
 
       for (const amt of CONFIG.PACKAGES) {
-        const [[cfg]] = await pool.query('SELECT * FROM stock_config WHERE amount = ?', [amt]);
-        embed.addFields({ name: `₹${amt}`, value: `\`${stockBar(0, cfg.max_stock)}\` — ${cfg.max_stock} available`, inline: true });
+        const s = await getStockStatus(amt);
+        const avail = s ? s.remaining : 0;
+        const total = s ? s.total_codes : 0;
+        embed.addFields({ name: `₹${amt}`, value: `\`${stockBar(0, Math.max(total, 1))}\` — **${avail}** codes in DB`, inline: true });
       }
 
       await interaction.editReply({ embeds: [embed] });
@@ -1370,7 +1526,7 @@ client.on('interactionCreate', async (interaction) => {
       if (s && s.is_sold_out) {
         return interaction.editReply({
           embeds: [new EmbedBuilder().setTitle('🔴 Package Sold Out')
-            .setDescription(`The **₹${amount}** gift card is currently **sold out** (${s.sold_count}/${s.max_stock} sold).\n\nPlease check back later or contact support.`)
+            .setDescription(`The **₹${amount}** gift card is currently **sold out** — no codes available in stock.\n\nPlease check back later or contact support.`)
             .setColor(0xFF0000)]
         });
       }
@@ -1396,13 +1552,14 @@ client.on('interactionCreate', async (interaction) => {
         .setTitle(`🎁 ₹${amount} Gift Card — Payment`)
         .setDescription(
           `${priceDesc}${lowStockWarn}\n\n` +
-          `**Step 1:** Scan the QR code below or pay to the UPI ID\n` +
+          `**Step 1:** Pay via **UPI** or **PayPal** (your choice)\n` +
           `**Step 2:** Click **"I've Paid — Submit Details"** below\n` +
           `**Step 3:** Fill in your transaction details\n` +
           `**Step 4:** Wait for admin approval — gift card sent via DM`
         )
         .addFields(
-          { name: '📱 UPI ID', value: `\`\`\`${CONFIG.UPI_ID}\`\`\``, inline: false },
+          { name: '📱 UPI ID', value: `\`\`\`${CONFIG.UPI_ID}\`\`\``, inline: true },
+          { name: '🅿️ PayPal', value: `\`\`\`${CONFIG.PAYPAL_ID}\`\`\``, inline: true },
           { name: '💸 Amount to Pay', value: `**₹${payPrice}**${offer ? ` (${offer.pct}% OFF on ₹${amount} face value)` : ''}`, inline: false }
         )
         .setImage(CONFIG.QR_IMAGE)
